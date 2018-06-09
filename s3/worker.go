@@ -7,8 +7,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/s3manager"
 	"log"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 const ALPHABET = "abcdefghijklmnopqrstuvwxyz" + "0123456789"
@@ -27,69 +29,91 @@ type WorkerPool struct {
 
 func (p *WorkerPool) Run() {
 	var wg sync.WaitGroup
+	nWorkers := int(p.Config.Concurrency)
+	workers := make([]*Worker, nWorkers)
 
 	log.Println("Pool started")
 
-	for i := 0; i < int(p.Config.Concurrency); i++ {
-		w := Worker{
-			Config: p.Config,
-			Client: p.Client,
-		}
+	for i := 0; i < nWorkers; i++ {
+		w := NewWorker(p.Config, p.Client)
+		workers[i] = w
 		wg.Add(1)
-		go w.Run(&wg)
+		go func() {
+			w.Run()
+			wg.Done()
+		}()
 	}
 	wg.Wait()
 
 	log.Println("Pool stopped")
+
+	stats := make([]*WorkerRuntimeStats, nWorkers)
+	for i := 0; i < nWorkers; i++ {
+		stats[i] = workers[i].Stats
+	}
+	mergedStats := MergeWorkerRuntimeStats(stats...)
+
+	log.Println("Runtime stats:")
+	mergedStats.WriteReport(os.Stdout)
 }
 
 type Worker struct {
 	Config Config
 	Client *s3.S3
+	Stats  *WorkerRuntimeStats
 }
 
-func (w *Worker) Run(wg *sync.WaitGroup) {
+func NewWorker(config Config, client *s3.S3) *Worker {
+	return &Worker{
+		Config: config,
+		Client: client,
+		Stats:  NewWorkerRuntimeStats(),
+	}
+}
+
+func (w *Worker) Run() {
 	log.Printf("worker %p running\n", w)
 
-	var localWG sync.WaitGroup
-	stats := WorkerRuntimeStats{
-		CurrentKey: makeRandomString(8),
-	}
+	var wg sync.WaitGroup
+	w.Stats.CurrentKey = makeRandomString(8)
 
 	downloader := s3manager.NewDownloaderWithClient(w.Client)
 	uploader := s3manager.NewUploaderWithClient(w.Client)
 
 	for i := 0; i < int(w.Config.NIterations); i++ {
-		switch op := chooseWorkerOp(stats, w.Config.RWRatio); op {
+		switch op := chooseWorkerOp(w.Stats, w.Config.RWRatio); op {
 		case WORKER_OP_READ:
-			localWG.Add(1)
-			stats.IncNReads()
+			wg.Add(1)
+			w.Stats.IncNReads()
 			go func() {
-				value := readObject(downloader, w.Config.Bucket, stats.CurrentKey)
-				if value == stats.CurrentValue {
-					stats.IncNLatestReads()
+				readStart := time.Now()
+				value := readObject(downloader, w.Config.Bucket, w.Stats.CurrentKey)
+				w.Stats.AddReadTiming(time.Since(readStart))
+				if value == w.Stats.CurrentValue {
+					w.Stats.IncNLatestReads()
 				} else {
-					stats.IncNStaleReads()
+					w.Stats.IncNStaleReads()
 				}
-				localWG.Done()
+				wg.Done()
 			}()
 		case WORKER_OP_WRITE:
-			localWG.Wait()
-			stats.CurrentValue = makeRandomString(64)
-			writeObject(uploader, w.Config.Bucket, stats.CurrentKey, stats.CurrentValue)
-			stats.IncNWrites()
+			log.Println("write")
+			wg.Wait()
+			w.Stats.CurrentValue = makeRandomString(64)
+			writeStart := time.Now()
+			writeObject(uploader, w.Config.Bucket, w.Stats.CurrentKey, w.Stats.CurrentValue)
+			w.Stats.AddWriteTiming(time.Since(writeStart))
+			w.Stats.IncNWrites()
 		default:
 			panic(fmt.Sprintf("unknown operation: %s", op))
 		}
 	}
 
-	localWG.Wait()
+	wg.Wait()
 	log.Printf("worker %p done\n", w)
-
-	wg.Done()
 }
 
-func chooseWorkerOp(stats WorkerRuntimeStats, rwRatio float64) WorkerOp {
+func chooseWorkerOp(stats *WorkerRuntimeStats, rwRatio float64) WorkerOp {
 	var op WorkerOp
 	nWrites := stats.GetNWrites()
 	if nWrites == 0 {
