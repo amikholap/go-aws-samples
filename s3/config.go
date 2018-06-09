@@ -6,5 +6,19 @@ import (
 
 type Config struct {
 	GlobalConfig *global.Config
-	Bucket       string
+
+	// Working bucket.
+	Bucket string
+
+	// Whether to clear the bucket before start.
+	Clear bool
+
+	// Number of concurrent workers.
+	Concurrency uint
+
+	// Number of iterations per worker.
+	NIterations uint
+
+	// Read/Write ratio.
+	RWRatio float64
 }
